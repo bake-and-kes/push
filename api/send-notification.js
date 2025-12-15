@@ -6,13 +6,13 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
+// Configurar VAPID con email desde variables de entorno
 webpush.setVapidDetails(
-  'mailto:tu@email.com',
+  process.env.VAPID_EMAIL || 'mailto:noreply@dokut.app',
   process.env.VAPID_PUBLIC_KEY,
   process.env.VAPID_PRIVATE_KEY
 );
 
-// Helper para configurar CORS
 const setCorsHeaders = (res) => {
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -23,10 +23,8 @@ const setCorsHeaders = (res) => {
 };
 
 export default async function handler(req, res) {
-  // Configurar CORS
   setCorsHeaders(res);
   
-  // Manejar preflight request
   if (req.method === 'OPTIONS') {
     return res.status(200).end();
   }
@@ -38,7 +36,6 @@ export default async function handler(req, res) {
   try {
     const { title, body, icon, url, campaign_name, store_id, user_id } = req.body;
 
-    // Validar datos requeridos
     if (!title || !body || !store_id || !user_id) {
       return res.status(400).json({ 
         success: false, 
@@ -72,7 +69,7 @@ export default async function handler(req, res) {
 
     console.log('✅ Campaña creada:', campaign.id);
 
-    // Obtener suscriptores ACTIVOS de esta tienda
+    // Obtener suscriptores ACTIVOS de esta tienda específica
     const { data: subscriptions, error: subError } = await supabase
       .from('push_subscriptions')
       .select('*')
@@ -85,7 +82,7 @@ export default async function handler(req, res) {
     }
 
     if (!subscriptions || subscriptions.length === 0) {
-      console.log('⚠️ No hay suscriptores activos para esta tienda');
+      console.log('⚠️ No hay suscriptores activos');
       
       await supabase
         .from('push_campaigns')
@@ -97,18 +94,17 @@ export default async function handler(req, res) {
         campaign_id: campaign.id,
         sent: 0,
         failed: 0,
-        message: 'No hay suscriptores activos'
+        message: 'No hay suscriptores activos. Los usuarios deben suscribirse.'
       });
     }
 
     console.log(`📧 Enviando a ${subscriptions.length} suscriptores`);
 
-    // Preparar notificación
     const notification = {
       title,
       body,
-      icon: icon || '/tls/ico.png',
-      badge: '/tls/ico.png',
+      icon: icon || '/icon.png',
+      badge: '/badge.png',
       data: {
         url: url || '/',
         campaign_id: campaign.id,
@@ -122,13 +118,12 @@ export default async function handler(req, res) {
       vibrate: [200, 100, 200]
     };
 
-    // Enviar a todos los suscriptores
     let sentCount = 0;
     let failedCount = 0;
 
     const sendPromises = subscriptions.map(async (sub) => {
       try {
-        await webpush.sendNotification(
+        const result = await webpush.sendNotification(
           {
             endpoint: sub.endpoint,
             keys: {
@@ -139,7 +134,6 @@ export default async function handler(req, res) {
           JSON.stringify(notification)
         );
         
-        // Registrar envío exitoso
         await supabase
           .from('push_sends')
           .insert([{
@@ -150,29 +144,32 @@ export default async function handler(req, res) {
           }]);
 
         sentCount++;
-        console.log(`✅ Enviado a suscriptor ${sub.id}`);
+        console.log(`✅ Enviado a ${sub.id} - Status: ${result.statusCode}`);
         
       } catch (error) {
-        console.error(`❌ Error enviando a ${sub.id}:`, error.message);
+        const statusCode = error.statusCode || error.status;
+        console.error(`❌ Error enviando a ${sub.id}:`, {
+          status: statusCode,
+          message: error.message
+        });
         
-        // Si el endpoint ya no es válido (410 Gone), desactivar suscripción
-        if (error.statusCode === 410 || error.statusCode === 404) {
+        // Desactivar si el endpoint es inválido
+        if (statusCode === 410 || statusCode === 404 || statusCode === 401) {
           await supabase
             .from('push_subscriptions')
             .update({ is_active: false })
             .eq('id', sub.id);
           
-          console.log(`🔕 Suscripción ${sub.id} desactivada (endpoint inválido)`);
+          console.log(`🔕 Suscripción ${sub.id} desactivada (código: ${statusCode})`);
         }
         
-        // Registrar envío fallido
         await supabase
           .from('push_sends')
           .insert([{
             campaign_id: campaign.id,
             subscription_id: sub.id,
             status: 'failed',
-            error_message: error.message,
+            error_message: `${statusCode}: ${error.message}`,
             sent_at: new Date().toISOString()
           }]);
         
@@ -182,7 +179,7 @@ export default async function handler(req, res) {
 
     await Promise.all(sendPromises);
 
-    // Actualizar estadísticas de la campaña
+    // Actualizar estadísticas
     await supabase
       .from('push_campaigns')
       .update({
@@ -197,7 +194,8 @@ export default async function handler(req, res) {
       success: true,
       campaign_id: campaign.id,
       sent: sentCount,
-      failed: failedCount
+      failed: failedCount,
+      total: subscriptions.length
     });
 
   } catch (error) {
