@@ -1,0 +1,12 @@
+{
+  "name": "dokut-push-backend",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev"
+  },
+  "dependencies": {
+    "web-push": "^3.6.7",
+    "@supabase/supabase-js": "^2.39.0"
+  }
+}
