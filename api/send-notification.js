@@ -13,12 +13,28 @@ webpush.setVapidDetails(
 );
 
 export default async function handler(req, res) {
+  // ✅ AGREGAR ESTOS HEADERS CORS
+  res.setHeader('Access-Control-Allow-Origin', '*'); // O 'https://dokuthub.online'
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  
+  // Manejar preflight request
+  if (req.method === 'OPTIONS') {
+    return res.status(200).end();
+  }
+
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Método no permitido' });
   }
 
   try {
     const { title, body, icon, url, campaign_name, store_id, user_id } = req.body;
+
+    // Validar autorización
+    const authHeader = req.headers.authorization;
+    if (!authHeader) {
+      return res.status(401).json({ error: 'No autorizado' });
+    }
 
     // Crear campaña
     const { data: campaign, error: campaignError } = await supabase
@@ -39,16 +55,14 @@ export default async function handler(req, res) {
 
     if (campaignError) throw campaignError;
 
-    // ⭐ OBTENER SOLO LOS SUSCRIPTORES DE ESTA TIENDA
+    // Obtener suscriptores de esta tienda
     const { data: subscriptions, error: subError } = await supabase
       .from('push_subscriptions')
       .select('*')
-      .eq('store_id', store_id) // ⭐ FILTRO POR TIENDA
+      .eq('store_id', store_id)
       .eq('is_active', true);
 
     if (subError) throw subError;
-
-    console.log(`📤 Enviando a ${subscriptions.length} suscriptores de la tienda ${store_id}`);
 
     // Preparar notificación
     const notification = {
@@ -66,6 +80,7 @@ export default async function handler(req, res) {
       ]
     };
 
+    // Enviar a todos los suscriptores
     let sentCount = 0;
     let failedCount = 0;
 
@@ -93,7 +108,7 @@ export default async function handler(req, res) {
 
         sentCount++;
       } catch (error) {
-        console.error('Error enviando:', error);
+        console.error('Error enviando a:', sub.id, error);
         
         if (error.statusCode === 410) {
           await supabase
