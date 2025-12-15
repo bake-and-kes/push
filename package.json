@@ -1,9 +1,9 @@
 {
   "name": "dokut-push-backend",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vercel dev"
+    "dev": "node --watch api/push.js"
   },
   "dependencies": {
     "web-push": "^3.6.7",
