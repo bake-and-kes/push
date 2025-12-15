@@ -12,12 +12,19 @@ webpush.setVapidDetails(
   process.env.VAPID_PRIVATE_KEY
 );
 
-export default async function handler(req, res) {
-  // ✅ AGREGAR ESTOS HEADERS CORS
-   res.setHeader('Access-Control-Allow-Credentials', 'true');
-  res.setHeader('Access-Control-Allow-Origin', 'https://dokuthub.online');
+// Helper para configurar CORS
+const setCorsHeaders = (res) => {
+  res.setHeader('Access-Control-Allow-Credentials', 'true');
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization');
+  res.setHeader('Access-Control-Allow-Headers', 
+    'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version, Authorization'
+  );
+};
+
+export default async function handler(req, res) {
+  // Configurar CORS
+  setCorsHeaders(res);
   
   // Manejar preflight request
   if (req.method === 'OPTIONS') {
@@ -25,17 +32,21 @@ export default async function handler(req, res) {
   }
 
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Método no permitido' });
+    return res.status(405).json({ success: false, error: 'Método no permitido' });
   }
 
   try {
     const { title, body, icon, url, campaign_name, store_id, user_id } = req.body;
 
-    // Validar autorización
-    const authHeader = req.headers.authorization;
-    if (!authHeader) {
-      return res.status(401).json({ error: 'No autorizado' });
+    // Validar datos requeridos
+    if (!title || !body || !store_id || !user_id) {
+      return res.status(400).json({ 
+        success: false, 
+        error: 'Faltan datos requeridos' 
+      });
     }
+
+    console.log('📤 Enviando notificación para tienda:', store_id);
 
     // Crear campaña
     const { data: campaign, error: campaignError } = await supabase
@@ -43,27 +54,54 @@ export default async function handler(req, res) {
       .insert([{
         store_id,
         user_id,
-        name: campaign_name,
+        name: campaign_name || 'Campaña sin nombre',
         title,
         body,
-        icon,
-        url,
+        icon: icon || null,
+        url: url || null,
         status: 'sent',
         sent_at: new Date().toISOString()
       }])
       .select()
       .single();
 
-    if (campaignError) throw campaignError;
+    if (campaignError) {
+      console.error('❌ Error creando campaña:', campaignError);
+      throw campaignError;
+    }
 
-    // Obtener suscriptores de esta tienda
+    console.log('✅ Campaña creada:', campaign.id);
+
+    // Obtener suscriptores ACTIVOS de esta tienda
     const { data: subscriptions, error: subError } = await supabase
       .from('push_subscriptions')
       .select('*')
       .eq('store_id', store_id)
       .eq('is_active', true);
 
-    if (subError) throw subError;
+    if (subError) {
+      console.error('❌ Error obteniendo suscriptores:', subError);
+      throw subError;
+    }
+
+    if (!subscriptions || subscriptions.length === 0) {
+      console.log('⚠️ No hay suscriptores activos para esta tienda');
+      
+      await supabase
+        .from('push_campaigns')
+        .update({ sent_count: 0, failed_count: 0 })
+        .eq('id', campaign.id);
+
+      return res.status(200).json({
+        success: true,
+        campaign_id: campaign.id,
+        sent: 0,
+        failed: 0,
+        message: 'No hay suscriptores activos'
+      });
+    }
+
+    console.log(`📧 Enviando a ${subscriptions.length} suscriptores`);
 
     // Preparar notificación
     const notification = {
@@ -73,12 +111,15 @@ export default async function handler(req, res) {
       badge: '/tls/ico.png',
       data: {
         url: url || '/',
-        campaign_id: campaign.id
+        campaign_id: campaign.id,
+        store_id: store_id
       },
       actions: [
         { action: 'open', title: '👀 Ver' },
         { action: 'close', title: '✖️ Cerrar' }
-      ]
+      ],
+      requireInteraction: false,
+      vibrate: [200, 100, 200]
     };
 
     // Enviar a todos los suscriptores
@@ -98,6 +139,7 @@ export default async function handler(req, res) {
           JSON.stringify(notification)
         );
         
+        // Registrar envío exitoso
         await supabase
           .from('push_sends')
           .insert([{
@@ -108,15 +150,31 @@ export default async function handler(req, res) {
           }]);
 
         sentCount++;
-      } catch (error) {
-        console.error('Error enviando a:', sub.id, error);
+        console.log(`✅ Enviado a suscriptor ${sub.id}`);
         
-        if (error.statusCode === 410) {
+      } catch (error) {
+        console.error(`❌ Error enviando a ${sub.id}:`, error.message);
+        
+        // Si el endpoint ya no es válido (410 Gone), desactivar suscripción
+        if (error.statusCode === 410 || error.statusCode === 404) {
           await supabase
             .from('push_subscriptions')
             .update({ is_active: false })
             .eq('id', sub.id);
+          
+          console.log(`🔕 Suscripción ${sub.id} desactivada (endpoint inválido)`);
         }
+        
+        // Registrar envío fallido
+        await supabase
+          .from('push_sends')
+          .insert([{
+            campaign_id: campaign.id,
+            subscription_id: sub.id,
+            status: 'failed',
+            error_message: error.message,
+            sent_at: new Date().toISOString()
+          }]);
         
         failedCount++;
       }
@@ -124,6 +182,7 @@ export default async function handler(req, res) {
 
     await Promise.all(sendPromises);
 
+    // Actualizar estadísticas de la campaña
     await supabase
       .from('push_campaigns')
       .update({
@@ -132,7 +191,9 @@ export default async function handler(req, res) {
       })
       .eq('id', campaign.id);
 
-    res.status(200).json({
+    console.log(`✅ Campaña completada - Enviados: ${sentCount}, Fallidos: ${failedCount}`);
+
+    return res.status(200).json({
       success: true,
       campaign_id: campaign.id,
       sent: sentCount,
@@ -140,8 +201,10 @@ export default async function handler(req, res) {
     });
 
   } catch (error) {
-    console.error('Error:', error);
-    res.status(500).json({ error: error.message });
+    console.error('❌ Error general:', error);
+    return res.status(500).json({ 
+      success: false, 
+      error: error.message || 'Error interno del servidor' 
+    });
   }
 }
-
